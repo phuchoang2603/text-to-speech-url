@@ -6,3 +6,5 @@ image/*
 
 # Ignore .csv files
 *.csv
+
+.venv

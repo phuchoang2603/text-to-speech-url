@@ -1,139 +1,69 @@
-import openai
+from flask import Flask, request, jsonify
 import requests
 import json
-import time
-import pandas as pd
-from google.cloud import storage
-from unidecode import unidecode
 from configparser import ConfigParser
 import os
-import logging
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+def upload_audio_file(object_location, oauth2_token, object_content_type, bucket_name, object_name):
+    url = f"https://storage.googleapis.com/upload/storage/v1/b/{bucket_name}/o?uploadType=media&name={object_name}"
+    headers = {
+        "Authorization": f"Bearer {oauth2_token}",
+        "Content-Type": object_content_type
+    }
+    with open(object_location, "rb") as file:
+        response = requests.post(url, data=file, headers=headers)
+    if response.status_code == 200:
+        print("Audio file uploaded successfully.")
+    else:
+        print("Error uploading audio file.")
 
-# Set up the Viettel API key
-config = ConfigParser()
-config.read('config.ini')
-viettel_api_key = config.get('viettel-ai', 'api_key')
-
-# Function that uploads a file to a Google Cloud Storage bucket
-def upload_blob(bucket_name, source_file_name, destination_blob_name):
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(destination_blob_name)
-
-    blob.upload_from_filename(source_file_name)
-
-    logging.info(f"File {source_file_name} uploaded to {destination_blob_name}.")
-
-# Function that generates the audio file for a given Vietnamese word
-def generate_audio(word_vn):
-    payload = json.dumps({
-        "text": word_vn,
+# Function that generates the audio file for a given text
+def generate_audio(text, viettel_api_key):
+    payload = {
+        "text": text,
         "voice": "hn-thaochi",
-        "speed": 0.7,
-        "tts_return_option": 2,
+        "speed": 1,
+        "tts_return_option": 3,
         "token": viettel_api_key,
         "without_filter": False
-    })
+    }
 
     headers = {'accept': '*/*','Content-Type': 'application/json'}
 
-    # Make the Viettel API call
-    response = requests.post(url="https://viettelai.vn/tts/speech_synthesis", headers=headers, data=payload)
+    response = requests.post('https://viettelgroup.ai/voice/api/tts/v1/rest/syn', data=json.dumps(payload), headers=headers)
 
-    return response
+    # save the audio file
+    with open('file.mp3', 'wb') as f:
+        f.write(response.content)
 
-# Function that generates the image for a given English word
-def generate_image(word_en):
-    prompt = f"{word_en}, digital art, brown background"
+app = Flask(__name__)
 
-    response = openai.Image.create(
-        prompt=prompt,
-        n=1,
-        size="256x256"
-    )
-
-    image_url = response['data'][0]['url']
-
-    return image_url
-
-# Main program
+@app.route('/', methods=['POST'])
 def main():
-    # Set up your OpenAI API credentials
-    openai.api_key = config.get('open-ai', 'api_key')
-
-    # Set up Google Cloud Storage bucket information
+    # Set up API key information
+    config = ConfigParser()
+    config.read('config.ini')
     bucket_name = config.get('google-cloud-storage', 'bucket_name')
+    viettel_api_key = config.get('viettel-ai', 'api_key')
+    oauth2_token = config.get('google-cloud-storage', 'oauth2_token')
 
-    # Set up csv input file path
-    csv_input = config.get('csv-file', 'input')
+    # Get the text from the request
+    text = request.form['text']
 
-    # Set up csv output file path
-    csv_output = config.get('csv-file', 'output')
+    # Generate the audio file from vietel.ai
+    generate_audio(text, viettel_api_key)
 
-    # Get the data from the CSV file
-    df = pd.read_csv(csv_input)
+    # Upload the audio file to Google Cloud Storage
+    object_location = "file.mp3"
+    object_content_type = "audio/mpeg"
+    bucket_name = bucket_name
+    # generate random name for audio file uploaded to GCS
+    object_name = os.urandom(16).hex() + ".mp3"
 
-    # Loop through each row in the DataFrame
-    for index, row in df.iterrows():
-        word_vn = row['word_vn']
-        word_en = row['word_en']
-        file_name = unidecode(word_vn).lower().replace(' ', '-').replace('/', '-') + '.' + word_en.lower()
-        
-        try:
-            # Generate the audio file for the Vietnamese word
-            audio_response = generate_audio(word_vn)
-            if audio_response.status_code == 200:
-                audio_filename = f"{file_name}.wav"
-                audio_path = os.path.join('audio', audio_filename)
-                with open(audio_path, 'wb') as f:
-                    f.write(audio_response.content)
-                logging.info(f"Saved audio for '{word_en}' as {audio_path}")
-            else:
-                logging.error(f"Failed to generate audio for '{word_en}'. Status code: {audio_response.status_code}")
+    upload_audio_file(object_location, oauth2_token, object_content_type, bucket_name, object_name)
 
-            # Generate the image for the English word
-            image_url = generate_image(word_en)
-            logging.info(f"Generated image for '{word_en}': {image_url}")
-            image_filename = f"{file_name}.png"
-            image_path = os.path.join('image', image_filename)
-            image_response = requests.get(image_url)
-            if image_response.status_code == 200:
-                with open(image_path, 'wb') as f:
-                    f.write(image_response.content)
-                logging.info(f"Saved image for '{word_en}' as {image_path}")
-            else:
-                logging.error(f"Failed to generate image for '{word_en}'. Status code: {image_response.status_code}")
+    # Return the URL of the audio file
+    return jsonify({"url": f"https://storage.googleapis.com/{bucket_name}/{object_name}"})
 
-            # Upload the audio file to Google Cloud Storage
-            upload_blob(bucket_name, audio_path, 'audio/' + audio_filename)
-            logging.info(f"Uploaded audio for '{word_en}' to Google Cloud Storage.")
-
-            # Upload the image to Google Cloud Storage
-            upload_blob(bucket_name, image_path, 'image/' + image_filename)
-            logging.info(f"Uploaded image for '{word_en}' to Google Cloud Storage.")
-
-            # Get the audio URL and image_url from the response and update the "pronunciation" and "image" column in the CSV file respectively
-            audio_url = f"https://storage.googleapis.com/{bucket_name}/audio/{audio_filename}"
-            image_url = f"https://storage.googleapis.com/{bucket_name}/image/{image_filename}"
-            df.at[index, 'pronunciation'] = audio_url
-            df.at[index, 'image'] = image_url
-
-            logging.info(f"Updated audio and image URL for '{word_en}' to {audio_url} and to {image_url}")
-        except Exception as e:
-            logging.error(f"Error processing word '{word_en}': {e}")
-
-        # Delay for 5 seconds to avoid hitting the OpenAI API rate limit
-        logging.info("Waiting 5 seconds to avoid hitting the OpenAI API rate limit...")
-        time.sleep(5)
-
-    # Save the updated DataFrame back to the CSV file
-    df.to_csv(csv_output, index=False)
-    logging.info(f"Saved updated DataFrame to {csv_output}.")
-
-
-# Run the main program
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
